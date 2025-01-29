@@ -43,6 +43,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 set_seed(0)
+# training manager
 accelerator = Accelerator(mixed_precision='fp16',
                           gradient_accumulation_steps=train_config["gradient_accumulation_steps"])
 
@@ -58,18 +59,40 @@ import numpy as np
 from transformers import get_linear_schedule_with_warmup, AutoConfig, get_cosine_schedule_with_warmup
 from torch.utils.tensorboard import SummaryWriter
 
+# main process record train_config in args.cpdir/tensorboard/
 if accelerator.is_main_process:
     writer = SummaryWriter(os.path.join(args.cpdir, f"tensorboard"))
     writer.add_text('config', json.dumps(train_config))
 
+# looks for a config.json file in the args.basepath directory
 baseconfig = AutoConfig.from_pretrained(args.basepath)
 
+# load hidden_size and vocab_size from baseconfig
 head = torch.nn.Linear(baseconfig.hidden_size, baseconfig.vocab_size, bias=False)
 
+# load only LM head's weights
+'''
+find weight from json file
+{
+    "weight_map": {
+        "lm_head.weight": "pytorch_model_part_0.bin",
+        "other_layer.weight": "pytorch_model_part_1.bin"
+        ...
+    }
+}
+'''
+
 try:
+    # Attempt to load from safetensors format
+    '''
+    basepath/
+    ├── model.safetensors.index.json   # First tries to find this index file
+    └── model_part_xxx.safetensors     # Then loads the actual weights file specified in index
+    '''
     with open(os.path.join(args.basepath, "model.safetensors.index.json"), "r") as f:
         index_json = json.loads(f.read())
         head_path = index_json["weight_map"]["lm_head.weight"]
+    # Load the actual weights using safetensors
     with safe_open(os.path.join(args.basepath, head_path),
                    framework="pt",
                    device="cpu") as f:
@@ -77,12 +100,18 @@ try:
         vocab_size, hidden_dim = tensor_slice.get_shape()
         tensor = tensor_slice[:, :hidden_dim].float()
 except:
+    '''
+    basepath/
+    ├── pytorch_model.bin.index.json   # Looks for this index file
+    └── pytorch_model_xxx.bin          # Then loads the weights file specified in index
+    '''
     with open(os.path.join(args.basepath, "pytorch_model.bin.index.json"), "r") as f:
         index_json = json.loads(f.read())
         head_path = index_json["weight_map"]["lm_head.weight"]
     weights = torch.load(os.path.join(args.basepath, head_path))
     tensor = weights["lm_head.weight"].float()
 
+# finish load LM head weight
 head.weight.data = tensor
 head.eval()
 
@@ -97,7 +126,27 @@ def list_files(path):
             datapath.append(file_path)
     return datapath
 
+'''
+Input Data File:
+{
+    'hidden_state': tensor[seq_len, hidden_dim],
+    'input_ids': tensor[seq_len],
+    'loss_mask': tensor[seq_len],
+    'hidden_state_layer2': tensor[seq_len, hidden_dim],  # if exit_layer=2
+    ...
+}
 
+Processed Output (new_data):
+{
+    'attention_mask': [1, 1, ..., 1],  # length=seq_len
+    'loss_mask': [1, 1, ..., 0],       # last position=0
+    'target': tensor[1, seq_len, hidden_dim],
+    'hidden_state_big': tensor[1, seq_len, hidden_dim],
+    'input_ids': tensor[1, seq_len],
+    'hidden_state_early': tensor[1, seq_len, hidden_dim]
+}
+
+'''
 class CustomDataset(Dataset):
     def __init__(self, datapath, transform=None):
         self.data = datapath
@@ -209,6 +258,19 @@ testdatapath = datapath[int(len(datapath) * 0.95):]
 # print('td',train_config["datapath"])
 # print(datapath)
 # exit()
+
+'''
+# For a sequence "The cat sat on"
+{
+    # Inputs
+    'hidden_state_early': tensor[1, 4, 768],  # Early layer hidden states
+    'attention_mask': [1, 1, 1, 1],          # All positions are valid
+
+    # Labels/Targets
+    'target': tensor[1, 4, 768],             # Final layer hidden states
+    'loss_mask': [1, 1, 1, 0],              # Compute loss for first 3 positions
+}
+'''
 traindataset = CustomDataset(traindatapath, transform=None)
 testdataset = CustomDataset(testdatapath)
 train_loader = DataLoader(traindataset, batch_size=train_config["bs"], shuffle=True,

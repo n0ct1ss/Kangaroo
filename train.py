@@ -65,6 +65,7 @@ if accelerator.is_main_process:
     writer.add_text('config', json.dumps(train_config))
 
 # looks for a config.json file in the args.basepath directory
+# load config file, which contains [hidden_size, vocab_size]
 baseconfig = AutoConfig.from_pretrained(args.basepath)
 
 # load hidden_size and vocab_size from baseconfig
